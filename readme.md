@@ -20,7 +20,7 @@ Parameters
 
 Pros
 - Easy to implement
-- Memory efficient
+- Memory efficient - O(1): `tokens` and `ts`
 - Handles bursts well (up to available tokens)
 
 Cons
@@ -37,7 +37,7 @@ Parameters
 - Outflow rate: how many requests are processed per second
 
 Pros
-- Memory efficient
+- Memory efficient - O(queue): `queue` and `ts`, Note: this can be reduced to O(1)
 - Good when you want a steady output rate
 
 Cons
@@ -55,7 +55,7 @@ Parameters
 
 Pros
 - Very easy to implement
-- Memory efficient
+- Memory efficient - O(1): `window_id` and `count`
 - Natural reset behavior each window
 
 Cons
@@ -75,7 +75,7 @@ Pros
 - Fine-grained control
 
 Cons
-- Higher memory usage (stores timestamps)
+- Higher memory usage (stores timestamps) - O(queue)
 
 ### Sliding Window Counter
 
@@ -84,7 +84,7 @@ Parameters
 - Threshold (max requests in the last window, approximated)
 
 Pros
-- Memory efficient
+- Memory efficient - O(1): `window_id`, `prev` and `curr` - Can be linked list ?
 - Smoother than fixed window; uses weighted counts
 
 Cons
@@ -93,14 +93,33 @@ Cons
 ## TODOs
 
 - Add observability: log decisions and expose counters (accepted/rejected per user)
+    - shoudld we expose the counters ? any security risk here ? whats the trade offs ?
+        - Safely expose per-user-request headers such as `X-RateLimi-Limit`,`X-RateLimi-Remaining` and `X-RateLimi-Retry-After` only to authenticated users.  
+
 - Add unit tests that simulate bursts, resets, and expiry boundaries
+    - whats expiry boundaries ?
+        - For fixed window: the boundary at t = k * window_size where a user can burst at the end of one window and the start of the next.
+        - For sliding windows: the boundary at now - window_seconds (exact cutoff); ensure you evict timestamps/counters correctly.
+        - For TTL-based KV stores: state might disappear mid-stream; your algorithm must handle missing state as “new key”.
+
+
 - Document design trade-offs (accuracy, memory, distributed locking, clock skew, persistence)
+    - sliding window log could be memory inefficient, as it appends new requests into the log. each time during rate limit decsion, we need to clear expired reqests. 
+        - If need scale, token bucket and sliding window counter are good candidates. 
+        - If need exactness, sliding window log but costs more memory. 
+    - In distributed setups, you avoid locks by using atomic KV operations (Redis INCR, Lua scripts) so the check+update happens atomically
+    - whats clock skew: 
+        - Window calculations based on wall-clock can allow extra requests or incorrectly reject.
+        - Use server-side time from the store when possible, or monotonic locally; in Redis, rely on Redis time inside Lua if you need consistency.
+    - presistence: Redis cache is a suitable options here as we need to store the Key and Value pairs based on the user and action. we can hash on "userid_action" as the key to avoid celebrity problem. We can add TTL to each key to expire any KV pair that is not regularly accessed. 
 - Optional extensions: middleware/decorator, Redis backend, Prometheus metrics
 
 ## Interview Talking Points
 
 - Algorithm trade-offs: fixed vs sliding, accuracy vs memory, burst behavior
 - Scaling: sharding keys, Redis TTLs, atomic increments, distributed counters, clock drift
+    - atomic increments: Atomic increment means the KV store guarantees increments aren’t lost under concurrency (e.g., Redis INCR). For more complex logic (sliding windows / token bucket), use a Redis `Lua` script to do read-modify-write atomically.
+
 - Observability: headers, logs, metrics, load testing
 
 ## Next Steps

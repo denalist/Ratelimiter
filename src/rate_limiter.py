@@ -2,6 +2,7 @@ import time
 from src.store import InMemoryKV
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, Optional, Tuple, TypeVar
+from collections import deque
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,7 @@ class RateLimiter:
        
         def do_update(state: Dict[str, any]) -> Tuple[Dict[str, Any], RateLimitDecision]:
             saved_window = float(state.get("window", window_id))
-            count = float(state.get("ts", now) )
+            count = float(state.get("count", 0) )
 
             # reset the window 
             if saved_window != window_id: 
@@ -118,51 +119,102 @@ class RateLimiter:
         return self._store.update(key, do_update)
 
 
-# from sortedcontainers import SortedSet
+    # 4. sliding window log 
+    def sliding_window_log(self, key, limit, window_seconds) -> RateLimitDecision: 
+        # fix the bursts at the boudry issue raised by the fixed_window_counter
+        # add request to a log, if exceeds the size, reject, else accept and append it to log. 
+        # remove previous logs that are outdated. 
+    
+        now = self._now()
+       
+        def do_update(state: Dict[str, any]) -> Tuple[Dict[str, Any], RateLimitDecision]:
+            raw = state.get("log")
+            log: Deque[float]
 
-# # sliding window log 
-# def sliding_window_log(threshold, window_seconds): 
-#     # fix the bursts at the boudry issue raised by the fixed_window_counter
-#     # add request to a log, if exceeds the size, reject, else accept and append it to log. 
-#     # remove previous logs that are outdated. 
+            if isinstance(raw, list): 
+                log = deque(float(x) for x in raw)
+            else: 
+                log = deque()
 
-#     # get the sorted log based on the user 
-#     log = SortedSet()
-#     prev_window = 0 # get this too 
+            # remove outdated records in lo, FIFO
+            window_start = now - window_seconds
+            while log and log[0] <= window_start: 
+                log.popleft()
 
-#     curr_window_start = prev_window + window_seconds
+            if len(log) + 1 <= limit: 
+                allowed = True
+                log.append(now) 
+                retry_after_sec = 0.0
+            else: 
+                allowed = False 
+                if window_seconds > 0: 
+                    retry_after_sec = log[0] + window_seconds - now   
+                else: 
+                    retry_after_sec = float("inf")
 
-#     # remove outdated timestamps 
-#     i = 0 
-#     while log[i] < curr_window_start:
-#         log.discard(log[i]) # ? BUG
-#         i += 1 
+            remaining = max(0, limit - len(log))
+            decision = RateLimitDecision(allowed=allowed, remaining=float(remaining), limit=float(limit), retry_after_sec=retry_after_sec)
 
-#     log.append(time.now()) # record both accept and reject requests 
-#     if len(log) < threshold: 
-#         return accept_message
-
-#     return reject_message
+            return {"log": list(log)}, decision
+        
+        # write count and window_start back 
+        return self._store.update(key, do_update)
 
 
-# # sliding window counter 
-# def sliding_window_count(threshold, window_seconds): 
-#     # in a rolling window of prev minute% + curr minute%, calculate the total time-weighted reuqests
-#     # check if it exceeds the threshold 
 
-#     # get the number of requests of previous minute 
-#     num_prev_req = 0 
-#     num_curr_req = 0 + 1 # get the request of curr min then add curr request 
+# 5. sliding window counter 
+def sliding_window_count(self, key, limit, window_seconds): 
+    # in a rolling window of prev minute% + curr minute%, calculate the total time-weighted reuqests
+    # check if it exceeds the threshold 
 
-#     # ttl= (1- elaspsed% of curr minute) * num_prev_req + num_curr_req TODO
-#     elasped_curr_min = time.now() # get the curr min % BUG 
+    now = self._now()
+    window_id = int(now//window_seconds) if window_seconds > 0 else 0
+    
+    def do_update(state: Dict[str, any]) -> Tuple[Dict[str, Any], RateLimitDecision]:
+        saved_window = float(state.get("window", window_id))
+        curr = float(state.get("curr", 0))
+        prev = float(state.get("prev", 0))
 
-#     ttl = (1-elasped_curr_min) * num_prev_req + num_curr_req
-#     # write num_curr_req back 
+        # reset the window 
+        if saved_window != window_id: 
+            count = 0 
+            saved_window = window_id
 
-#     if ttl <= threshold: 
-#         return accept_message
-#     return reject_message
+        if saved_window == window_id:
+            pass
+        elif saved_window == window_id - 1:
+            prev, curr = curr, 0
+            saved_window = window_id
+        else:
+            prev, curr = 0, 0
+            saved_window = window_id
+
+        window_start = window_id * window_seconds
+        elapsed_into_window = float(0.0, now-window_start)
+        prev_weight = max(0.0, 
+                          min(1.0, (1 - elapsed_into_window/window_seconds))
+                          )
+        
+        estimated = prev_weight * prev + curr
+
+        if estimated + 1 <= limit:
+            curr += 1 
+            allowed = True
+            retry_after_sec = 0.0
+        else: 
+            allowed = False
+            if window_seconds > 0: 
+                retry_after_sec = max(0.0, window_seconds-elapsed_into_window)
+            else: 
+                retry_after_sec = float("inf")
+
+        remaining = max(0.0, float(limit) - (curr + prev * prev_weight))
+        decision = RateLimitDecision(allowed=allowed, remaining=float(remaining), limit=float(limit), retry_after_sec=retry_after_sec)
+
+        return {"window": saved_window, "prev": prev, "curr": curr}, decision
+    
+    # write count and window_start back 
+    return self._store.update(key, do_update)
 
 
 
